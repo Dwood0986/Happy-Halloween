@@ -1,0 +1,918 @@
+<head><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+    <script type="text/plain" id="Pumpkin.glsl">
+    //path trace pumpkin scene shader
+    attribute vec3 vpos;
+    varying vec4 uv;
+    uniform sampler2D buffer, background, pumpkin;
+    uniform vec4 params[10];/*0.xy = aspect/fov
+    0.z = frame id/1000
+    0.w = aa pixel size
+    
+    1.xyz = camera position
+    1.w = pumpkin height scale
+    2.xy = camera roll cos/sin
+    2.zw = camera pitch cos/sin
+    3.xy = camera yaw cos/sin
+    3.z = floor height
+    3.w = floor scale
+    
+    4.xyz = background tint
+    4.w = pumpkin dents
+    
+    5.x = pumpkin main grooves frequency
+    5.y = pumpkin main grooves scale
+    5.zw = pumpkin grooves 1 frequency/scale
+    6.xy = pumpkin grooves 2
+    6.zw = pumpkin grooves 3
+    
+    7.xyz = pumpkin color
+    7.w = floor height
+    
+    8.xyz = floor tint
+    8.w pumpkin bounding radius pow 2
+    
+    9.xyz = light color
+    9.w = light radius
+    */
+    
+    #define FLOOR_ENABLED 1
+    #define TRANSPARENT_ENABLED 1
+    
+    #ifdef FLOOR_ENABLED
+    #define ITER 100
+    #else
+    #define ITER 50
+    #endif
+    #define EPSILON 0.02
+    #define NEPS 0.01
+    #define SEPS .1
+    
+    #define PI 3.141592653589793
+    
+    
+    #ifdef FLOOR_ENABLED
+    uniform sampler2D floorCol, floorHeight, floorRough;
+    #endif
+    
+    
+    //2d rotation matrix
+    mat2 r2d(float a) {
+        float c = cos(a), s = sin(a);
+        return mat2(c,s,-s,c);
+    }
+    
+    //returns pseudo random value 0-1
+    vec4 hash(vec4 s) {
+        s = abs(s);
+        vec4 r = fract(s.zxwy*vec4(2334.2378764,1263.237653,862.12378645,5226.827364))*576.987654321;
+        return fract(r*mat4(1,-.5,-.25,.75,
+                      -.25,-1,.75,.5,
+                      -.75,.25,1,.5,
+                      .25,-.5,.75,1));
+    }
+    
+    //repeating triangle wave
+    float twave(float x) {
+        return abs(fract(x)*2.-1.);
+    }
+    
+    
+    //returns vec2(distance,material id)
+    vec2 geometry(vec3 p) {
+        vec2 geo;
+    
+        //pumpkin
+        vec3 apy = p;
+        apy.y *= params[1].w;
+        float aplen = length(apy);
+        //geo.x = abs(aplen-.95);
+        if (aplen < 1.2) {//only do complex details within bounds
+            float pang = atan(p.x,p.z)+PI*4.+cos(p.y*15.)*.01+sin(p.y*44.)*0.003,
+                plen = length(p.xz),
+                grooves = cos(pang*params[5].z)*params[5].w+cos(pang*params[6].x)*params[6].y+cos(pang*params[6].z)*params[6].w+
+                        pow(max(twave(pang*params[5].x)-.5, 0.)*2., 4.)*params[5].y;
+    
+            float pthick = texture2D(pumpkin,vec2(atan(apy.z,apy.x)/6.2831853071+.5,acos(apy.y/aplen)/3.14159265)).x*.05,
+                dents = pow(min(.75,abs(apy.y))*max(0.,1.-plen),2.)*params[4].w;//bottom and top dents
+            aplen += grooves+dents;
+        
+            geo.x = abs(aplen-.95);
+            if (geo.x <= .05+SEPS) {
+                if (pthick < 0.0002) geo = vec2(SEPS,3);
+                else geo = vec2(min(SEPS,abs(aplen-.9-pthick)-pthick), pthick<.0495||aplen<.99?4.+aplen:0.);
+            } else geo = vec2(geo.x-.05,0);
+            
+            //stem
+            float sd = max(length(p.xz)-.05-grooves,abs(dot(p-vec3(0,.8,0),normalize(vec3(.6,1,-.3))))-.2)-clamp(.05-geo.x*.5, 0.,.05);
+            if (sd < geo.x) geo = vec2(sd,2);
+            
+        } else {
+            geo = vec2(aplen-1.,0);
+        }
+        
+        //light
+        if (aplen < .95) {
+            float lightd = length(p+vec3(0,params[7].w-params[9].w-.1,0))-params[9].w;
+            if (lightd < geo.x) geo = vec2(lightd,3);
+        }
+    
+        //floor
+        #ifdef FLOOR_ENABLED
+        float fd = p.y+params[7].w;
+        if (fd < .2) fd += (1.-texture2D(floorHeight,p.xz*params[3].w).x)*params[3].z;//only apply detail map within bounds
+        if (fd < geo.x) geo = vec2(fd,1);
+        #endif
+        
+        return geo;
+    }
+    
+    //returns material mat3(vec3 color, float roughness, float emission, float subsurfaceOpacity, float subsurfaceScattering)
+    mat3 material(vec3 p, float mat, vec4 rand) {
+        #ifdef FLOOR_ENABLED
+        if (mat == 1.) {//floor
+            vec2 puv = p.xz*params[3].w;
+            return mat3(texture2D(floorCol,puv).xyz*params[8].xyz, pow(texture2D(floorRough,puv).x,3.),0,0, 0,0,0);
+        }
+        #endif
+    
+        //stem
+        if (mat == 2.) {
+            float ang = atan(p.x,p.z);
+            return mat3(mix(vec3(.0011,.004,.0011),vec3(.59,.42,.27), cos(ang*12.2764+5.*cos(ang+p.y*8.))*clamp(length(p.xz)*10.-.5,0.,.5)+.5),
+                        .3,0,0, 0,0,0);
+        }
+        
+        //light
+        if (mat == 3.) {
+            float ll = length(params[9].xyz);
+            return mat3(params[9].xyz*(1./max(1e-6,ll)), 1,ll,0, 0,0,0);
+        }
+        
+        //inner pumpkin
+        if (mat >= 4.) {
+            //gloss
+            mat3 om = mat3(vec3(0.982,0.781,0.41), .3,0,max(0.,mat-4.9)*2., .7,0,0);
+            if (rand.w < 0.3) {
+                om[0].xyz = vec3(.95);
+                om[1].x = .005;
+            }
+            return om;
+        }
+        
+        //pumpkin outside
+        if (rand.w < 0.15) return mat3(mix(params[7].xyz,vec3(1),0.5), .025,0,0, 0,0,0);//gloss
+        return mat3(params[7].xyz, .25,0,0, 0,0,0);
+    }
+    
+    //normal at point
+    vec3 normal(vec3 p) {
+        vec3 n = vec3(geometry(p+vec3(NEPS,0,0)).x,geometry(p+vec3(0,NEPS,0)).x,geometry(p+vec3(0,0,NEPS)).x)-geometry(p).x;
+        return (n.x==0.&&n.y==0.&&n.z==0.)?vec3(0,1,0):normalize(n);
+    }
+    
+    
+    //raytrace bounds, returns 1e8 if nothing hit
+    float boundsTrace(vec3 rp, vec3 rd) {
+        float pumpBoundsL = dot(rp,rp)-params[8].w,
+            pumpBoundsA = dot(rp,rd);
+        if (pumpBoundsL <= 0.) return -1.;
+        pumpBoundsL = pumpBoundsA*pumpBoundsA-pumpBoundsL;
+        if (pumpBoundsL >= 0.) {
+            pumpBoundsL = sqrt(pumpBoundsL);
+            if (pumpBoundsL < -pumpBoundsA) pumpBoundsL = -pumpBoundsA-pumpBoundsL+EPSILON;
+            else pumpBoundsL = 1e8;
+        } else pumpBoundsL = 1e8;
+    
+        #ifdef FLOOR_ENABLED
+        float fbDst = rp.y+params[7].w-EPSILON*2.;
+        if (fbDst <= 0.) return -1.;
+        if (rd.y < 0.) pumpBoundsL = min(pumpBoundsL,-fbDst/rd.y+EPSILON);
+        #endif
+        
+        return pumpBoundsL;
+    }
+    
+    
+    void VERT() {
+        uv = vec4(vpos.xy*.5+.5, vpos.xy*params[0].xy+(hash(params[0].z*vec4(.1,1,10,100)).xy-.5)*params[0].w);
+        gl_Position = vec4(vpos,1);
+    }
+    void FRAG() {
+        //setup ray to trace
+        vec3 rp = params[1].xyz,
+            rd = normalize(vec3(uv.zw,1)),
+            c = vec3(1),
+            l = vec3(0);
+        vec4 random = hash(vec4(uv.yzw,params[0].z));
+        bool bounced = false;
+        float ldst = 0.;
+        
+        //camera rotation
+        rd.xy *= mat2(params[2].xy,-params[2].y,params[2].x);//roll
+        rd.yz *= mat2(params[2].zw,-params[2].w,params[2].z);//pitch
+        rd.xz *= mat2(params[3].xy,-params[3].y,params[3].x);//yaw
+        
+        //initial bounds ray trace
+        float boundsDst = boundsTrace(rp,rd);
+        
+        if (boundsDst < 1e8) {
+            rp += rd*max(0.,boundsDst);
+            
+            //path tracing ray march loop
+            for (int i = 0; i < ITER; i++) {
+                vec2 geo = geometry(rp);
+                if (geo.x < EPSILON) {
+                    mat3 mat = material(rp,geo.y,random);//sample material
+                    c *= mat[0];
+                    l += c*mat[1].y;//emission
+                
+                    random = hash(vec4(rp,params[0].z));
+                    if (mat[1].z > random.z) {
+                        rd = normalize(rd+(random.xyw-.5)*mat[2].x);
+                        geo.x = SEPS;//subsurface scattering
+                    } else {
+                        rp -= rd*ldst;
+                        vec3 nrm = normal(rp),
+                            tang = normalize(cross(abs(nrm.y)>(1.-1e-5)?vec3(0,0,-1):vec3(0,-1,0),nrm)),
+                            bitang = cross(tang,nrm);
+                        float cs = pow(random.x,mat[1].x), sn = sqrt(1.-cs*cs), ang = random.y*PI*2.;
+                        rd = reflect(rd,normalize(mat3(nrm,tang,bitang)*vec3(cs,sn*cos(ang),sn*sin(ang))));//opaque scatter, reflect ray off random microsurface bump
+                        geo.x = EPSILON;
+                    }
+                    bounced = true;
+                }
+                
+                #ifdef FLOOR_ENABLED
+                float rayDst = boundsTrace(rp,rd);
+                if (rayDst < 1e8 && rayDst > -1.) {
+                    rp += rd*rayDst;
+                } else {
+                    rp += rd*geo.x*(.5+.5*random.z);
+                    ldst = geo.x;
+                }
+                #else
+                rp += rd*geo.x*(.5+.5*random.z);
+                ldst = geo.x;
+                #endif
+            }
+    
+        }
+        
+        //background
+        vec4 bg = pow(texture2D(background,vec2(atan(rd.z,rd.x)/6.2831853071+.5,acos(rd.y)/3.14159265)),vec4(2.2))*params[4];
+        #ifdef TRANSPARENT_ENABLED
+        if (bounced) l += c*bg.xyz;
+        
+        //add sample to buffer
+        gl_FragColor = (params[0].z==0.?vec4(0):texture2D(buffer,uv.xy))+vec4(l,bounced?1.:0.);
+        
+        #else
+        l += bounced?c*bg.xyz:bg.xyz;
+        
+        //add sample to buffer
+        gl_FragColor = (params[0].z==0.?vec4(0):texture2D(buffer,uv.xy))+vec4(l,1);
+        #endif
+    }
+    </script>
+    
+    <script type="text/plain" id="Display.glsl">
+    //display path tracer
+    attribute vec3 vpos;
+    varying vec2 uv;
+    uniform sampler2D buffer;
+    
+    void VERT() {
+        uv = vpos.xy*.5+.5;
+        gl_Position = vec4(vpos,1);
+    }
+    void FRAG() {
+        vec4 sum = texture2D(buffer,uv);
+        gl_FragColor = pow(sum/sum.w,vec4(1./2.2));//normalize and gamma correct
+    }
+    </script>
+    
+    <script type="text/plain" id="DisplayTransparent.glsl">
+    //display transparent path tracer
+    attribute vec3 vpos;
+    varying vec2 uv;
+    uniform sampler2D buffer;
+    uniform float samples;
+    
+    void VERT() {
+        uv = vpos.xy*.5+.5;
+        gl_Position = vec4(vpos,1);
+    }
+    void FRAG() {
+        gl_FragColor = pow(clamp(texture2D(buffer,uv)/samples,0.,1.),vec4(1./2.2));//normalize and gamma correct
+    }
+    </script>
+    
+    
+    <script type="text/plain" id="Scoop.glsl">
+    //scoop pumpkin
+    attribute vec3 vpos;
+    varying vec2 uv;
+    uniform sampler2D map;
+    uniform vec4 params[2];/*0.xy = 2nd last point, 1e8 if disabled
+    0.zw = last point
+    1.xy = current point
+    
+    1.z = radius
+    1.w = opacity*/
+    
+    float sline(vec2 a, vec2 b, float sx) {
+        vec2 pa = uv-a, ba = b-a;
+        pa -= ba*clamp(dot(pa,ba)/dot(ba,ba),0.,1.);
+        pa.x *= sx;
+        return length(pa);
+    }
+    
+    float scoop(vec2 last, vec2 curr, float sideX, float scaleCorrect) {//scoop brush, capsule line with sine distribution
+        float psx = curr.x<.5?-1.:1.;
+        vec2 diff = last-curr;
+        if (length(diff) < length(diff+vec2(psx,0))) psx = 0.;
+        return sin(max(0.,1.-min(sline(last+vec2(psx,0),curr,scaleCorrect),
+                sline(last+vec2(psx+sideX,0),curr+vec2(sideX,0),scaleCorrect))/params[1].z)*1.5707963267);
+    }
+    
+    void VERT() {
+        uv = vpos.xy*.5+.5;
+        gl_Position = vec4(vpos,1);
+    }
+    void FRAG() {
+        float val = texture2D(map,uv).x,
+            sideX = uv.x<.5?-1.:1.,
+            scaleCorrect = 2.-pow(abs(uv.y-.5)*2.,2.)*1.9,
+            sub = scoop(params[0].zw,params[1].xy,sideX,scaleCorrect);//current stroke
+        if (params[0].x < 1e8) sub = max(0.,sub-scoop(params[0].xy,params[0].zw,sideX,scaleCorrect));//subtract last stroke
+        val -= sub*params[1].w;
+        gl_FragColor = vec4(max(val,0.),0,0,1);
+    }
+    </script>
+    
+    
+    <script type="text/plain" id="Knife.glsl">
+    //knife carve pumpkin
+    attribute vec3 vpos;
+    varying vec2 uv;
+    uniform sampler2D map;
+    uniform vec4 params[2];/*0.xy = 2nd last point, 1e8 if disabled
+    0.zw = last point
+    1.xy = current point
+    
+    1.z = radius
+    1.w = opacity*/
+    
+    float line(vec2 a, vec2 b, float sx) {
+        vec2 dir = b-a;
+        float dlen = length(dir);
+        if (dlen == 0.) {
+            return 1e8;
+        }
+        
+        dir *= 1./dlen;
+        vec2 rp = uv-b;
+        rp.x *= sx;
+        float ax = abs(dot(rp,dir)-dlen*.5)-dlen*.5,
+            ay = abs(dot(rp,vec2(-dir.y,dir.x)));
+        return max(ax,ay);
+    }
+    
+    float knife(vec2 last, vec2 curr, float sideX, float scaleCorrect) {//scoop brush, capsule line with sine distribution
+        float psx = curr.x<.5?-1.:1.;
+        vec2 diff = last-curr;
+        if (length(diff) < length(diff+vec2(psx,0))) psx = 0.;
+        return max(0.,1.-min(line(last+vec2(psx,0),curr,scaleCorrect),
+                line(last+vec2(psx+sideX,0),curr+vec2(sideX,0),scaleCorrect))/params[1].z);
+    }
+    
+    void VERT() {
+        uv = vpos.xy*.5+.5;
+        gl_Position = vec4(vpos,1);
+    }
+    void FRAG() {
+        float val = texture2D(map,uv).x,
+            sideX = uv.x<.5?-1.:1.,
+            scaleCorrect = 2.-pow(abs(uv.y-.5)*2.,2.)*1.9,
+            sub = knife(params[0].zw,params[1].xy,sideX,scaleCorrect);//current stroke
+        if (params[0].x < 1e8) sub = max(0.,sub-knife(params[0].xy,params[0].zw,sideX,scaleCorrect));//subtract last stroke
+        val -= sub*params[1].w;
+        gl_FragColor = vec4(max(val,0.),0,0,1);
+    }
+    </script>
+    
+    
+    <script type="text/plain" id="FloodFillClear.glsl">
+    //flood fill/clear pumpkin
+    attribute vec3 vpos;
+    varying vec2 uv;
+    uniform sampler2D map;
+    uniform vec4 params[2];/*1.xy = current point
+    1.z = fill/clear value
+    1.w = opacity*/
+    
+    void VERT() {
+        uv = vpos.xy*.5+.5;
+        gl_Position = vec4(vpos,1);
+    }
+    void FRAG() {
+        vec4 val = texture2D(map,uv), ov;
+        if (val.y == 1.) val.x = params[1].z;
+        if (length(params[1].xy-uv) < 1./512.) val.y = 1.;
+        
+        #define AS(ox,oy) ov = texture2D(map,uv+vec2(ox,oy)/vec2(1024,512)); if (ov.y == 1. && abs(ov.x-val.x) < params[1].w) {val.y = 1.;}
+        
+        AS(-1,-1);
+        AS(0,-1);
+        AS(1,-1);
+        AS(1,0);
+        AS(1,1);
+        AS(0,1);
+        AS(-1,1);
+        AS(-1,0);
+        
+        gl_FragColor = val;
+    }
+    </script>
+    
+    
+    <script type="text/plain" id="FloodReset.glsl">
+    //reset flood buffer state
+    attribute vec3 vpos;
+    varying vec2 uv;
+    uniform sampler2D map;
+    
+    void VERT() {
+        uv = vpos.xy*.5+.5;
+        gl_Position = vec4(vpos,1);
+    }
+    void FRAG() {
+        vec4 val = texture2D(map,uv), ov;
+        val.y = 0.;
+        gl_FragColor = val;
+    }
+    </script>
+    
+    
+    <script type="text/plain" id="Copy.glsl">
+    //copy and flip y for saving
+    attribute vec3 vpos;
+    varying vec2 uv;
+    uniform sampler2D buffer;
+    
+    void VERT() {
+        uv = vpos.xy*vec2(.5,-.5)+.5;
+        gl_Position = vec4(vpos,1);
+    }
+    void FRAG() {
+        gl_FragColor = texture2D(buffer,uv);
+    }
+    </script>
+    <script type="text/javascript">
+    (function(){function va(a,b,c,e){a?(a=d.LINEAR,b=b?d.LINEAR_MIPMAP_LINEAR:d.LINEAR):(a=d.NEAREST,b=b?d.NEAREST_MIPMAP_LINEAR:d.NEAREST);d.texParameteri(d.TEXTURE_2D,d.TEXTURE_MAG_FILTER,a);d.texParameteri(d.TEXTURE_2D,d.TEXTURE_MIN_FILTER,b);d.texParameteri(d.TEXTURE_2D,d.TEXTURE_WRAP_S,c?d.REPEAT:d.CLAMP_TO_EDGE);d.texParameteri(d.TEXTURE_2D,d.TEXTURE_WRAP_T,e?d.REPEAT:d.CLAMP_TO_EDGE)}function G(a,b){var c=V.indexOf(d.INVALID_VALUE);-1===c?c=V.push(a)-1:V[c]=a;d.activeTexture(d.TEXTURE0+c);d.bindTexture(d.TEXTURE_2D,
+    b);d.uniform1i(a,c)}function W(){for(var a=0;a<V.length;a++)V[a]=d.INVALID_VALUE}function yb(a,b){b=d.createShader(b);d.shaderSource(b,a);d.compileShader(b);return d.getShaderParameter(b,d.COMPILE_STATUS)?b:(console.error("Error compiling GLSL shader: "+d.getShaderInfoLog(b)+"\nFrom shader:"),console.log(a),d.deleteShader(b),null)}function Ua(a){for(var b=0;b<a.length&&-1!==(b=a.indexOf('#include "',b));){var c=a.indexOf('"',b+10);if(-1!==c){var e=document.getElementById(a.substring(b+10,c));e&&(a=
+    a.substring(0,b)+e.textContent+a.substring(c+1));b=c}else b++}a="#version 100\nprecision highp float;precision highp int;"+a;b=a.indexOf("void VERT()");e=a.indexOf("void FRAG()");if(-1!==b&&-1!==e){var g=a.substring(0,b)+"void main()"+a.substring(e+11);for(b=0;-1!==(b=g.indexOf("attribute",b));)c=g.indexOf(";",b+9),-1!==c?g=g.substring(0,b)+g.substring(c+1):b++;b=yb(a.substring(0,e).replace("void VERT()","void main()"),d.VERTEX_SHADER);c=yb(g,d.FRAGMENT_SHADER);if(b&&c)if(a=d.createProgram(),d.attachShader(a,
+    b),d.attachShader(a,c),d.bindAttribLocation(a,0,"vpos"),d.linkProgram(a),d.detachShader(a,b),d.detachShader(a,c),d.deleteShader(b),d.deleteShader(c),d.getProgramParameter(a,d.LINK_STATUS)){b=d.getProgramParameter(a,d.ACTIVE_UNIFORMS);for(c=0;c<b;c++)e=d.getActiveUniform(a,c),g=e.name.indexOf("["),this[-1===g?e.name:e.name.substring(0,g)]=d.getUniformLocation(a,e.name);this.N=0;this.W=a;fc.push(this)}else console.error("Error linking GLSL program: "+d.getProgramInfoLog(a))}}function O(a,b){this.K=
+    d.createFramebuffer();this.c=d.createTexture();this.width=a;this.height=b;var c=a+b;this.A=a/c;this.B=b/c;d.bindTexture(d.TEXTURE_2D,this.c);d.texImage2D(d.TEXTURE_2D,0,d.RGBA,a,b,0,d.RGBA,d.UNSIGNED_BYTE,null);va(!1,!1,!1,!1);d.bindFramebuffer(d.FRAMEBUFFER,this.K);d.framebufferTexture2D(d.FRAMEBUFFER,d.COLOR_ATTACHMENT0,d.TEXTURE_2D,this.c,0);Va=this;Wa=Xa=0;Ya=a;Za=b}function gc(a,b){la=a;window.indexedDB?(a=window.indexedDB.open(a,1),a.h=b,a.onsuccess=hc,a.onerror=ic,a.onupgradeneeded=jc):b()}
+    function ic(a){P=la=null;a.target.h()}function hc(a){P=a.target.result;a.target.h&&a.target.h()}function jc(a){P=a.target.result;P.createObjectStore("o");a.target.h&&setTimeout(a.target.h,0)}function kc(a){a.target.h(a.target.v)}function lc(a){a.target.h(a.target.v,a.target.result)}function mc(a){a.target.h&&a.target.h(a.target.v,!0)}function nc(a){a.target.h&&a.target.h(a.target.v,!1)}function oc(){zb=[new Q(226,130,50),new Q(225,108,42),new Q(241,179,42),new Q(241,186,110)];r=document.getElementById("uipanel");
+    wa=document.getElementById("bgpanel");xa=document.getElementById("floorpanel");ya=document.getElementById("pumpkinpanel");za=document.getElementById("renderpanel");Aa=document.getElementById("renderingpanel");$a=document.getElementById("resultpanel");ab=document.getElementById("creditspanel");bb=document.getElementById("guidepanel");Z=document.getElementById("confirmpanel");cb=document.getElementById("errorpanel");Ab=document.getElementById("custom_bg_img");Bb=document.getElementById("custom_floor_color");
+    Cb=document.getElementById("custom_floor_height");Db=document.getElementById("custom_floor_rough");Eb=document.getElementById("rendering_state");Fb("backgrounds",Gb,1);Fb("floors",Hb,0);M=new X(["backgrounds","floors","tool_size","tool_depth"]);C=new X("bg_color bg_exposure light_color light_strength light_size camera_fov".split(" "));R=new X(["floor_color","floor_scale","floor_height"]);v=new X("pumpkin_color pumpkin_height pumpkin_indent pumpkin_rate0 pumpkin_size0 pumpkin_rate1 pumpkin_size1 pumpkin_rate2 pumpkin_size2 pumpkin_rate3 pumpkin_size3".split(" "));
+    ma=new X(["render_width","render_height","render_samples","render_trans"]);H[0]=document.getElementById("tool_carve");H[1]=document.getElementById("tool_scoop");H[2]=document.getElementById("tool_fill");H[3]=document.getElementById("tool_clear");l("tool_carve",function(){H[w].className="btn";w=pc;H[w].className="btn btn_sel";J&&aa()});l("tool_scoop",function(){H[w].className="btn";w=qc;H[w].className="btn btn_sel";J&&aa()});l("tool_fill",function(){H[w].className="btn";w=Ib;H[w].className="btn btn_sel"});
+    l("tool_clear",function(){H[w].className="btn";w=rc;H[w].className="btn btn_sel"});H[0].click();l("new",function(){Ba=0;p(Z)});l("save",function(){Ca&&URL.revokeObjectURL(Ca);Ca=URL.createObjectURL(new Blob([JSON.stringify(Jb())]));Kb(Ca,"Pumpkin.json")});l("load",function(){Ba=1;p(Z)});l("confirm_yes",function(){switch(Ba){case 0:D.j();d.clearColor(1,0,0,1);d.clear(d.COLOR_BUFFER_BIT);db(sc);break;case 1:ba(tc,".json",!1);break;case 2:ba(uc,"image/*",!1)}p(Z)});l("confirm_no",function(){p(Z)});M.backgrounds.a=
+    function(b){if(b=b.value)Da.image.src="Backgrounds/"+Gb[b]+".jpg";var c=eb;eb=b;0===c!==(0===b)&&fb()};M.floors.a=function(b){(b=b.value)?(na=!0,b="Floors/"+Hb[b],Ea.image.src=b+"_Color.jpg",Fa.image.src=b+"_Height.jpg",Ga.image.src=b+"_Rough.jpg"):(na=!1,m())};l("pumpkin_rand",function(){for(var b=v.elements,c=0;c<b.length;c++){var e=b[c];if(e.type===gb){var g=Math.random(),k=parseFloat(e.element.min),q=parseFloat(e.element.max);if("any"===e.element.step)g=k+(q-k)*g;else{var F=parseFloat(e.element.step);
+    g=k+Math.floor((q-k)*g/F)*F}e.J(g)}else if(e.type===oa){g=Math.random();k=1-g;q=Math.random();F=1-q;var K=Math.random(),x=1-K,t=zb;e.J(new Q(Math.round((t[0].r*k+t[1].r*g)*x+(t[2].r*F+t[3].r*q)*K),Math.round((t[0].m*k+t[1].m*g)*x+(t[2].m*F+t[3].m*q)*K),Math.round((t[0].l*k+t[1].l*g)*x+(t[2].l*F+t[3].l*q)*K)))}e.a&&e.a(e)}});l("background_cfg",function(){p(wa)&&(xa.style.display="none",ya.style.display="none")});l("floor_cfg",function(){p(xa)&&(wa.style.display="none",ya.style.display="none")});l("pumpkin_cfg",
+    function(){p(ya)&&(wa.style.display="none",xa.style.display="none")});C.bg_color.a=function(){fb()};C.bg_exposure.a=function(){fb()};C.light_color.a=function(){Lb();m()};C.light_strength.a=function(){Lb();m()};C.light_size.a=function(b){h[39]=b.value;m()};C.camera_fov.a=function(b){S=b.value;ca();m()};l("bg_load_custom",function(){ba(vc,"image/*",!1)});R.floor_color.a=function(b){h[32]=Math.pow(b.value.r/255,2.2);h[33]=Math.pow(b.value.m/255,2.2);h[34]=Math.pow(b.value.l/255,2.2);m()};R.floor_height.a=
+    function(b){h[14]=b.value;hb();m()};R.floor_scale.a=function(b){h[15]=2*Math.pow(b.value,3);m()};l("floor_load_color",function(){ba(wc,"image/*",!1)});l("floor_load_height",function(){ba(xc,"image/*",!1)});l("floor_load_rough",function(){ba(yc,"image/*",!1)});v.pumpkin_color.a=function(b){h[28]=Math.pow(b.value.r/255,2.2);h[29]=Math.pow(b.value.m/255,2.2);h[30]=Math.pow(b.value.l/255,2.2);m()};v.pumpkin_height.a=function(b){h[7]=1/b.value;hb();Mb();m()};v.pumpkin_indent.a=function(b){h[19]=b.value;
+    hb();Mb();m()};v.pumpkin_rate0.a=function(b){h[20]=b.value/(2*Math.PI);m()};v.pumpkin_size0.a=function(b){h[21]=b.value;m()};v.pumpkin_rate1.a=function(b){h[22]=b.value;m()};v.pumpkin_size1.a=function(b){h[23]=b.value;m()};v.pumpkin_rate2.a=function(b){h[24]=b.value;m()};v.pumpkin_size2.a=function(b){h[25]=b.value;m()};v.pumpkin_rate3.a=function(b){h[26]=b.value;m()};v.pumpkin_size3.a=function(b){h[27]=b.value;m()};l("pumpkin_import",function(){Ba=2;p(Z)});l("pumpkin_export",function(){Kb(Nb(),"PumpkinMap.png")});
+    ib=document.getElementById("free_camera");ib.addEventListener("click",function(){u.M(0,0,0);jb=kb=0;lb=-3;da=3;Y=!Y;ib.className=Y?"btn btn_sel":"btn";ea();m()});l("render",function(){p(za)});l("begin_render",function(){p(za);p(Aa);var b=ma.render_width.value,c=ma.render_height.value;y.w(b,c,d.RGBA,d.RGBA,d.FLOAT);fa.w(b,c,d.RGBA,d.RGBA,d.FLOAT);h[0]=S*y.A;h[1]=S*y.B;h[3]=4/(b+c);pa=Ha=h[2]=0;ha=Ia=1;qa=0;Ja=ma.render_samples.value;N=!0});l("cancel_render",function(){p(za)});l("cancel_rendering",
+    function(){N=!1;ca();p(Aa)});l("close_result",function(){p($a)});l("view_controls",function(){p(bb)});l("close_controls",function(){p(bb)});l("view_credits",function(){p(ab)});l("close_credits",function(){p(ab)});l("error_close",function(){p(cb)});var a="ontouchstart"in window;document.getElementById("mousecontrols").style.display=a?"none":"block";document.getElementById("touchcontrols").style.display=a?"block":"none"}function l(a,b){document.getElementById(a).addEventListener("click",b)}function p(a){var b=
+    "none"==a.style.display;a.style.display=b?"block":"none";return b}function Kb(a,b){var c=document.createElement("a");c.href=a;c.download=b;c.click()}function ba(a,b,c){var e=document.createElement("input");e.type="file";b&&(e.accept=b);c&&(e.multiple=!0);e.addEventListener("change",a);e.click()}function Fb(a,b,c){a=document.getElementById(a);for(var e=0;e<b.length;e++){var g=document.createElement("option");g.textContent=b[e];a.appendChild(g)}a.selectedIndex=c?c:0}function vc(a){(a=a.target.files)&&
+    a.length&&(a=URL.createObjectURL(a[0]),Da.image.src=a,Ab.src=a,mb&&URL.revokeObjectURL(mb),mb=a)}function wc(a){(a=a.target.files)&&a.length&&(a=URL.createObjectURL(a[0]),Ea.image.src=a,Bb.src=a,nb&&URL.revokeObjectURL(nb),nb=a)}function xc(a){(a=a.target.files)&&a.length&&(a=URL.createObjectURL(a[0]),Fa.image.src=a,Cb.src=a,ob&&URL.revokeObjectURL(ob),ob=a)}function yc(a){(a=a.target.files)&&a.length&&(a=URL.createObjectURL(a[0]),Ga.image.src=a,Db.src=a,pb&&URL.revokeObjectURL(pb),pb=a)}function tc(a){if((a=
+    a.target.files)&&a.length){var b=new FileReader;b.onload=zc;b.readAsText(a[0])}}function zc(a){db(JSON.parse(a.target.result))}function uc(a){(a=a.target.files)&&a.length&&(a=URL.createObjectURL(a[0]),ia.src=a,qb&&URL.revokeObjectURL(qb),qb=a)}function T(a){a=a.elements;for(var b=0;b<a.length;b++){var c=a[b];c.a&&c.a(c)}}function Ob(a,b,c){this.id=a;this.element=b;this.U=c;a=rb;"checkbox"===b.type?a=sb:"text"===b.type?a=tb:"number"===b.type?a=Pb:"range"===b.type?a=gb:"color"===b.type?a=oa:"TEXTAREA"===
+    b.tagName&&(a=tb);this.type=a;this.value="color"===b.type?new Q:null;this.a=null;this.P=!1}function Q(a,b,c){this.r=a?a:0;this.g=b?b:0;this.b=c?c:0}function X(a,b){this.elements=Array(a.length);this.R=!1;for(var c=0;c<a.length;c++){var e=b?b[c]:document.getElementById(a[c]),g=new Ob(c,e,this);this.elements[c]=g;this[a[c]]=g;e.V=g;e.addEventListener("input",Qb);Qb({target:e})}}function Qb(a){a=a.target;var b=a.V,c=b.value;switch(b.type){case sb:b.value=a.checked;break;case tb:b.value=a.value;break;
+    case Pb:var e=a.step&&1==a.step?parseInt(a.value):parseFloat(a.value);a.value=b.value=Math.max(a.min?a.min:-Number.MAX_VALUE,Math.min(a.max?a.max:Number.MAX_VALUE,isNaN(e)||!isFinite(e)?0:e));break;case gb:b.value=parseFloat(a.value);break;case oa:b.value.O(a.value);break;case rb:b.value=parseInt(a.selectedIndex)}if(c!==b.value||b.type===oa)b.P=b.U.R=!0,b.a&&b.a(b)}function Ac(){E=document.getElementsByTagName("canvas")[0];E.width=E.height=1;var a={alpha:!0,antialias:!1,depth:!1,failIfMajorPerformanceCaveat:!1,
+    preserveDrawingBuffer:!1};(d=E.getContext("webgl",a))||(d=E.getContext("experimental-webgl",a));d?(d.enable(d.SCISSOR_TEST),a=d.createBuffer(),d.bindBuffer(d.ARRAY_BUFFER,a),d.bufferData(d.ARRAY_BUFFER,new Float32Array([2,1,-2,1,0,-3]),d.STATIC_DRAW),d.vertexAttribPointer(0,2,d.FLOAT,!1,8,0),d.enableVertexAttribArray(0),a.X=2,a=!0):a=!1;if(!a)return Rb("Fatal Error: Your system does not support WebGL 2."),!1;if(!d.getExtension("OES_texture_float"))return Rb("Fatal Error: Your system does not support floating point render textures."),
+    !1;d.enable(d.CULL_FACE);d.cullFace(d.BACK);d.disable(d.DEPTH_TEST);d.depthMask(!1);d.clearDepth(1);d.disable(d.STENCIL_TEST);d.disable(d.BLEND);d.enable(d.SCISSOR_TEST);d.colorMask(!0,!0,!0,!0);Ka=U("Display.glsl");Sb=U("DisplayTransparent.glsl");Tb=U("Pumpkin.glsl","FLOOR_ENABLED","TRANSPARENT_ENABLED");ub=U("Copy.glsl");ra[0]=U("Knife.glsl");ra[1]=U("Scoop.glsl");ra[2]=U("FloodFillClear.glsl");vb=U("FloodReset.glsl");y=new O(1,1);fa=new O(1,1);D=new O(1024,512);va(!0,!1,!0,!0);L=new O(1024,512);
+    va(!0,!1,!0,!0);new O(1024,512);Da=new La(!0,!1,!0,!0);Ea=new La(!0,!1,!0,!0);Fa=new La(!0,!1,!0,!0,!0);Ga=new La(!0,!1,!0,!0,!0);D.j();d.clearColor(1,0,0,1);d.clear(d.COLOR_BUFFER_BIT);ca();window.addEventListener("resize",ca);return!0}function La(a,b,c,e,g){this.image=new Image;this.image.T=this;this.image.addEventListener("load",Bc);this.c=d.createTexture();this.S=g?!0:!1;d.bindTexture(d.TEXTURE_2D,this.c);va(a,b,c,e)}function Bc(a){a=a.target.T;for(var b=a.S?d.LUMINANCE:d.RGBA,c=a.image.width,
+    e=a.image.height,g=1,k=1,q=a.image;g<c;)g*=2;for(;k<e;)k*=2;if(g!==c||k!==e)c=document.createElement("canvas"),e=c.getContext("2d"),c.width=g,c.height=k,e.drawImage(q,0,0,g,k),q=c;d.bindTexture(d.TEXTURE_2D,a.c);d.texImage2D(d.TEXTURE_2D,0,b,b,d.UNSIGNED_BYTE,q);m()}function U(a){var b=document.getElementById(a).textContent;if(1<arguments.length){for(var c=arguments.length-1,e=1<<c,g=Array(e),k=0;k<e;k++){for(var q=b,F=0;F<c;F++)if(0===(k>>F&1)){var K="#define "+arguments[F+1];q=q.replace(K,"//"+
+    K)}g[k]=new Ua(q)}return g}return new Ua(b)}function m(){N||(h[2]=0)}function fb(){var a=0===eb?0:Math.pow(C.bg_exposure.value,2),b=C.bg_color.value;h[16]=Math.pow(b.r/255,2.2)*a;h[17]=Math.pow(b.m/255,2.2)*a;h[18]=Math.pow(b.l/255,2.2)*a;m()}function hb(){h[31]=.75+.8*(1/h[7]-.8)-.35*h[14]-.1*h[19]}function Mb(){var a=Math.max(1.05/h[7]-h[19],1.2);h[35]=a*a}function Lb(){var a=C.light_color.value,b=C.light_strength.value;h[36]=Math.pow(a.r/255,2.2)*b;h[37]=Math.pow(a.m/255,2.2)*b;h[38]=Math.pow(a.l/
+    255,2.2)*b}function ca(){if(!N){var a=window.devicePixelRatio;a||(a=1);E.width=z.width=Math.floor(window.innerWidth*a);E.height=z.height=Math.floor(window.innerHeight*a);if(1!==a||1!==Ub)E.style.width=window.innerWidth+"px",E.style.height=window.innerHeight+"px";Ub=a;y.w(z.width,z.height,d.RGBA,d.RGBA,d.FLOAT);fa.w(z.width,z.height,d.RGBA,d.RGBA,d.FLOAT);h[0]=S*y.A;h[1]=S*y.B;h[3]=2*S/(z.width+z.height);m()}}function Vb(){y.j();if(N)var a=ma.render_trans.value;var b=Tb[(na?1:0)+(a?2:0)];b.o();d.uniform4fv(b.params,
+    h);G(b.buffer,fa.c);G(b.background,Da.c);G(b.pumpkin,D.c);na&&(G(b.floorCol,Ea.c),G(b.floorHeight,Fa.c),G(b.floorRough,Ga.c));d.drawArrays(d.TRIANGLES,0,3);W();N?(0===qa%20&&(Eb.textContent="Rendered "+qa+"/"+Ja+" samples..."),qa++,qa>=Ja&&(p(Aa),p($a),E.width=z.width=y.width,E.height=z.height=y.height,z.j(),b=a?Sb:Ka,b.o(),a&&d.uniform1f(b.samples,Ja),G(b.buffer,y.c),d.drawArrays(d.TRIANGLES,0,3),W(),document.getElementById("result_img").src=E.toDataURL(),N=!1,ca())):(z.j(),Ka.o(),G(Ka.buffer,y.c),
+    d.drawArrays(d.TRIANGLES,0,3),W());a=y;y=fa;fa=a;h[2]+=.001}function Cc(){u=new Ma;ea();for(var a=0;a<A.length;a++)A[a]=1E8;r.addEventListener("mousedown",function(b){b.target===r&&(2===b.button?(Na=!0,b.preventDefault(),b.stopPropagation()):0===b.button&&(wb=!0,Oa(b.clientX,b.clientY)))});r.addEventListener("mouseup",function(b){if(b.target===r)if(2===b.button)Na=!1,b.preventDefault(),b.stopPropagation();else if(0===b.button){Oa(b.clientX,b.clientY);wb=!1;for(b=0;4>b;b++)A[b]=1E8;J&&aa()}});r.addEventListener("mousemove",
+    function(b){if(Na){var c=3/window.innerHeight;u.M(u.i,u.f-b.movementY*c,u.s+b.movementX*c);ea();m()}else wb&&Oa(b.clientX,b.clientY)});r.addEventListener("contextmenu",function(b){if(Na||b.target===r)b.preventDefault(),b.stopPropagation()});r.addEventListener("touchstart",function(b){b=b.changedTouches;for(var c=0;c<b.length;c++)B.push(b[c]),ja.push(b[c].identifier);Wb()});r.addEventListener("touchmove",function(b){b=b.changedTouches;for(var c=0;c<b.length;c++){var e=ja.indexOf(b[c].identifier);-1!==
+    e&&(B[e]=b[c])}Wb()});r.addEventListener("touchend",function(b){b=b.changedTouches;for(var c=0;c<b.length;c++){var e=ja.indexOf(b[c].identifier);-1!==e&&(B.splice(e,1),ja.splice(e,1))}if(2>B.length){sa=-1;for(c=0;4>c;c++)A[c]=1E8;J&&aa()}});r.addEventListener("touchcancel",function(b){b=b.changedTouches;for(var c=0;c<b.length;c++){var e=ja.indexOf(b[c].identifier);-1!==e&&(B.splice(e,1),ja.splice(e,1))}if(2>B.length){sa=-1;for(c=0;4>c;c++)A[c]=1E8;J&&aa()}});r.addEventListener("wheel",function(b){b.target===
+    r&&!Y&&(b=Math.sign(b.deltaX)+Math.sign(b.deltaY)+Math.sign(b.deltaZ))&&(da=0<b?1.1*da:da/1.1,ea(),m())});Xb=new Pa(["w","W","ArrowUp"]);Yb=new Pa(["d","D","ArrowRight"]);Zb=new Pa(["s","S","ArrowDown"]);$b=new Pa(["a","A","ArrowLeft"]);r.focus();r.addEventListener("keydown",function(b){if(b.target===r){var c=xb[b.key];c&&(c.u=!0,b.preventDefault(),b.stopPropagation())}});r.addEventListener("keyup",function(b){if(b.target===r){var c=xb[b.key];c&&(c.u=!1,b.preventDefault(),b.stopPropagation())}})}
+    function Pa(a){this.u=!1;for(var b=0;b<a.length;b++)xb[a[b]]=this}function Wb(){if(1<B.length){for(var a=0,b=0,c=0,e=0;e<B.length;e++){var g=B[e];a+=g.clientX;b+=g.clientY}a/=B.length;b/=B.length;for(e=0;e<B.length;e++){g=B[e];var k=g.clientX-a;g=g.clientY-b;c=Math.max(c,Math.sqrt(k*k+g*g))}if(-1!==sa){e=a-ac;k=b-bc;g=3/window.innerHeight;var q=!1;if(e||k)u.M(u.i,u.f-k*g,u.s+e*g),q=!0;e=sa/Math.max(1E-6,c);1===e||Y||(da*=e);q&&(ea(),m())}ac=a;bc=b;sa=c}if(1===B.length)Oa(B[0].clientX,B[0].clientY);
+    else{for(e=0;4>e;e++)A[e]=1E8;J&&aa()}}function ea(){Y?(Qa=kb,ka=jb,Ra=lb):(u.L(0,0,-da),Qa=n[0],ka=n[1],Ra=n[2]);na&&(ka=Math.max(ka,.03-h[31]));h[4]=Qa;h[5]=ka;h[6]=Ra;h[8]=u.F;h[9]=u.G;h[10]=u.C;h[11]=u.D;h[12]=u.H;h[13]=u.I}function Ma(a,b,c){this.i=a?a:0;this.f=b?b:0;this.s=c?c:0;this.F=Math.cos(this.i);this.G=Math.sin(this.i);this.C=Math.cos(this.f);this.D=Math.sin(this.f);this.H=Math.cos(this.s);this.I=Math.sin(this.s)}function Oa(a,b){if(!J){var c=(a/window.innerWidth*2-1)*S*y.A,e=(b/window.innerHeight*
+    2-1)*S*-y.B,g=1/Math.sqrt(c*c+e*e+1);a=b=1E8;u.L(c*g,e*g,g);a:{c=Qa;e=ka;g=Ra;for(var k=n[0],q=n[1],F=n[2],K=0;100>K;K++){var x=e;var t=Math.atan(c,g)+4*Math.PI+.01*Math.cos(15*x)+.003*Math.sin(44*x),Dc=Math.sqrt(c*c+g*g);t=Math.cos(t*h[22])*h[23]+Math.cos(t*h[24])*h[25]+Math.cos(t*h[26])*h[27]+Math.pow(2*Math.max(Math.abs(t*h[20]%1*2-1)-.5,0),4)*h[21];x*=h[7];x=Math.abs(Math.sqrt(c*c+x*x+g*g)-.95+t+Math.pow(Math.min(.75,Math.abs(x))*Math.max(0,1-Dc),2)*h[19])-.05;if(.02>x){n[0]=c-.02*k;n[1]=e-.02*
+    q;n[2]=g-.02*F;c=!0;break a}x*=.75;c+=k*x;e+=q*x;g+=F*x}c=!1}if(c){g=1/Math.max(1E-6,Math.sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]));b=Math.atan2(n[2],n[0])/(2*Math.PI)+.5;a=Math.acos(n[1]*g)/Math.PI;1E8<=A[2]&&(A[2]=b,A[3]=a);for(c=0;4>c;c++)I[c]=A[c];I[4]=b;I[5]=a;I[6]=M.tool_size.value;I[7]=M.tool_depth.value;1<I[7]&&(I[7]=1+100*Math.pow(I[7]-1,4));1<w&&(I[6]=w===Ib?1:0);L.j();c=ra[Math.min(2,w)];c.o();d.uniform4fv(c.params,I);G(c.map,D.c);d.drawArrays(d.TRIANGLES,0,3);W();c=D;D=L;L=c;1<w&&(J=!0);m()}A[0]=
+    A[2];A[1]=A[3];A[2]=b;A[3]=a}}function aa(){L.j();vb.o();G(vb.map,D.c);d.drawArrays(d.TRIANGLES,0,3);W();var a=D;D=L;L=a;J=!1}function Rb(a){document.body.innerHTML="<span class='fatalcrash'>"+a+"</span>"}function cc(a,b){b&&db(JSON.parse(b))}function Jb(){var a={};a.main=M.f();a.bg=C.f();a.floor=R.f();a.pumpkin=v.f();a.map=Nb();return a}function db(a){ia.src=a.map;M.i(a.main);C.i(a.bg);R.i(a.floor);v.i(a.pumpkin);T(M);T(C);T(R);T(v)}function Nb(){E.width=z.width=1024;E.height=z.height=512;z.j();
+    ub.o();G(ub.buffer,D.c);d.drawArrays(d.TRIANGLES,0,3);W();var a=E.toDataURL();ca();return a}function dc(){var a=Date.now();ta=(a-ua)/1E3;if(N){for(var b=0;b<ha&&N;b++)Vb();Ha+=ha;pa+=ta;1<=pa&&(b=Ha/pa,b>=Ia?ha++:b<.75*Ia&&(ha=Math.max(1,ha-1)),Ia=b,pa=Ha=0)}else if(!document.hidden){if(Y){var c=b=0;Xb.u&&c++;Zb.u&&c--;Yb.u&&b++;$b.u&&b--;(b||c)&&m();u.L(3*b,0,3*c);kb+=n[0]*ta;jb+=n[1]*ta;lb+=n[2]*ta;ea()}J&&(L.j(),b=ra[2],b.o(),d.uniform4fv(b.params,I),G(b.map,D.c),d.drawArrays(d.TRIANGLES,0,3),
+    W(),b=D,D=L,L=b,.01<h[2]&&m());Vb()}ua=a;requestAnimationFrame(dc)}var d,E,V=[],fc=[],Sa={},Ta=null;Ua.prototype.o=function(){if(Ta!==this){if(Ta)for(var a in Sa)a in Ta&&!Sa[a].data&&(V[V.indexOf(this[a])]=d.INVALID_VALUE);Ta=this;d.useProgram(this.W);for(a in Sa){var b=this[a];if(void 0!==b){var c=Sa[a];c.data?c.Y>this.N&&d.uniform4fv(b,c.data):G(b,c.c)}}this.N=Date.now()}};var Va=null,z={K:null,width:0,height:0},Wa,Xa,Ya,Za;O.prototype.w=function(a,b,c,e,g){c||(c=d.RGBA);e||(e=d.RGBA);g||(g=d.UNSIGNED_BYTE);
+    this.width=a;this.height=b;var k=a+b;this.A=a/k;this.B=b/k;d.bindTexture(d.TEXTURE_2D,this.c);d.texImage2D(d.TEXTURE_2D,0,c,a,b,0,e,g,void 0)};O.prototype.j=function(a,b,c,e){4>arguments.length&&(a=b=0,c=this.width,e=this.height);if(Va!==this||Wa!==a||Xa!==b||Ya!==c||Za!==e)Va=this,Wa=a,Xa=b,Ya=c,Za=e,d.bindFramebuffer(d.FRAMEBUFFER,this.K),d.viewport(a,b,c,e),d.scissor(a,b,c,e)};z.j=O.prototype.j;window.indexedDB||(window.indexedDB=window.indexedDB||window.f||window.s||window.i);var la=null,P=null,
+    r,wa,xa,ya,za,Aa,$a,ab,bb,Z,cb,ib,Eb,M,C,R,v,ma,Ab,mb=null,Bb,nb=null,Cb,ob=null,Db,pb=null,H=Array(4),Ca=null,qb=null,Ba=0,zb,sb=0,tb=1,Pb=2,gb=3,oa=4,rb=5;Ob.prototype.J=function(a){this.type===oa?(Object.assign(this.value,a),this.element.value=this.value.f()):this.type===rb?(this.value=a,this.element.selectedIndex=a):this.type===sb?(this.value=a,this.element.checked=a):this.element.value=this.value=a};Q.prototype.O=function(a){this.r=parseInt(a.substring(1,3),16);this.m=parseInt(a.substring(3,
+    5),16);this.l=parseInt(a.substring(5,7),16)};Q.prototype.f=function(){var a=this.r.toString(16);var b="#"+(1===a.length?"0"+a:a);a=this.m.toString(16);b+=1===a.length?"0"+a:a;a=this.l.toString(16);return b+(1===a.length?"0"+a:a)};X.prototype.f=function(){for(var a={},b=this.elements,c=0;c<b.length;c++)a[b[c].element.id]=this.elements[c].value;return a};X.prototype.i=function(a){for(var b in a){var c=this[b];c&&c.J(a[b])}};var y,fa,Tb,Ka,Sb,ub,ra=Array(3),vb,h=new Float32Array(40),I=new Float32Array(8),
+    D,L,Da,Ea,Fa,Ga,na=!1,N=!1,Ja=0,qa=0,eb=0,Ub=1,kb=0,jb=0,lb=0,Qa=0,ka=0,Ra=0,da=3,u,S=2,xb={},Xb,Yb,Zb,$b,wb=!1,Na=!1,Y=!1,w=0,J=!1,A=Array(4),B=[],ja=[],ac=0,bc=0,sa=-1,Gb="None Park Woods Snowy Desert Hall City".split(" "),Hb=["None","Planks","Stone","Leaves","Metal"],pc=0,qc=1,Ib=2,rc=3;new Ma;Ma.prototype.M=function(a,b,c){this.i=a;this.f=b;this.s=c;this.F=Math.cos(a);this.G=Math.sin(a);this.C=Math.cos(b);this.D=Math.sin(b);this.H=Math.cos(c);this.I=Math.sin(c)};Ma.prototype.L=function(a,b,c){this.i&&
+    (n[0]=a,a=a*this.F+b*this.G,b=b*this.F-n[0]*this.G);this.f?(n[1]=b*this.C+c*this.D,c=c*this.C-b*this.D):n[1]=b;this.s?(n[0]=a*this.H+c*this.I,n[2]=c*this.H-a*this.I):(n[0]=a,n[2]=c)};var ua=0,ta=0,Ha=0,pa=0,ha=1,Ia=1,n=new Float32Array(16),ia=new Image,ec=0,sc={main:{backgrounds:1,floors:0,tool_size:.0181761143410853,tool_depth:1},bg:{bg_color:{r:255,g:255,b:255},bg_exposure:1,light_color:{r:255,g:255,b:255},light_strength:1,light_size:.02,camera_fov:1.2},floor:{floor_color:{r:255,g:255,b:255},floor_scale:.5,
+    floor_height:.2},pumpkin:{pumpkin_color:{r:235,g:155,b:49},pumpkin_height:1,pumpkin_indent:.5,pumpkin_rate0:10,pumpkin_size0:.01,pumpkin_rate1:10,pumpkin_size1:.005,pumpkin_rate2:18,pumpkin_size2:.005,pumpkin_rate3:33,pumpkin_size3:.003}};document.addEventListener("DOMContentLoaded",function(){Ac()&&(oc(),Cc(),gc("PumpkinCarvingSimulator",function(){if(la)if(P){var a=P.transaction(["o"]).objectStore("o").get("s");a.h=cc;a.v="s";a.onsuccess=lc;a.onerror=kc}else{a=null;try{a=window.localStorage[la+
+    "s"]}catch(b){}cc("s",a)}}),window.addEventListener("beforeunload",function(a){var b=JSON.stringify(Jb());if(P){var c=P.transaction(["o"],"readwrite");c.h=void 0;c.v="s";c.oncomplete=mc;c.onerror=nc;c.objectStore("o").put(b,"s")}else try{window.localStorage[la+"s"]=b}catch(e){}b=ec;ec=ua;if(2E4<ua-b)return a.returnValue="Are you sure? You have unsaved changes."}),T(M),T(R),T(C),T(v),ua=Date.now(),dc())});ia.onload=function(){1024==ia.width&&512==ia.height?(d.bindTexture(d.TEXTURE_2D,D.c),d.texImage2D(d.TEXTURE_2D,
+    0,d.RGBA,d.RGBA,d.UNSIGNED_BYTE,ia)):p(cb)}})();
+    </script>
+    <title>Pumpkin Carving Simulator</title>
+    <style>
+    body,html {
+        margin: 0px;
+        padding: 0px;
+        font-size: 1.8vw;
+        font-family: "Arial Black", sans-serif;
+        color: #ffffff;
+        overflow: hidden;
+    }
+    canvas, #uipanel {
+        position: absolute;
+        left: 0px; top: 0px;
+        z-index: 0;
+    }
+    #uipanel {
+        width: 100%;
+        height: 100%;
+        z-index: 1;
+    }
+    div.sidepanel {
+        background-color: rgba(20,20,20,0.5);
+        left: 0vw;
+        width: 18vw;
+        top: 0vw;
+        bottom: 11vw;
+        
+        position: absolute;
+        overflow-y: auto;
+        padding: 1vw;
+    }
+    
+    #menu {
+        background-color: rgba(20,20,20,0.5);
+        position: absolute;
+        bottom: 0vw;
+        width: 100vw;
+        height: 10vw;
+        padding-top: 0.2vw;
+        padding-left: 0.4vw;
+        padding-right: 0.6vw;
+    }
+    
+    span.fatalcrash {
+        position: absolute;
+        left: 0px;
+        top: 0px;
+        width: 100%;
+        height: 100%;
+        z-index: 1000000;
+        font-size: 4vw;
+        background-color: #101010;
+        color: #ffffff;
+        text-shadow: #ff0000 0.1vw 0.2vw, #ff0000 -0.2vw -0.1vw;
+        text-align: center;
+    }
+    
+    div.panel {
+        position: absolute;
+        width: 100%;
+        height: 100%;
+        z-index: 2;
+        background-color: rgba(0,0,0,0.9);
+        text-align: center;
+        overflow-y: auto;
+    }
+    span.btn {
+        display: inline-block;
+        text-align: center;
+        user-select: none;
+        cursor: pointer;
+        background: radial-gradient(ellipse farthest-corner at center center, #050505 0%, #101010 40%, #252525 100%);
+        border: 0.2vw outset #505050;
+    }
+    span.btn:hover {
+        background: linear-gradient(155deg, transparent 0%, rgba(0,0,0,1) 100%),
+            radial-gradient(ellipse farthest-corner at center center, #050505 0%, #101010 40%, #ffffff 100%);
+    }
+    span.btn_sel, span.btn_sel:hover {
+        background: #404040;
+    }
+    
+    span.tool {
+        position: absolute;
+        left: 0%;
+        top: 10%;
+        width: 99%;
+        text-align: center;
+        text-shadow: 0.2vw 0.2vw 0vw #000000;
+    }
+    
+    span.ptitle {
+        font-size: 2.4vw;
+        text-decoration: underline;
+    }
+    
+    
+    
+    select, option {
+        font-family: "Lucida Console",monospace;
+        font-size: 1.8vw;
+        background-color: #101010;
+        color: #efefef;
+        border: 0.2vw inset #909090;
+    }
+    select:focus {
+        outline: none;
+    }
+    input {
+        font-size: 1.8vw;
+    }
+    label {
+        user-select: none;
+    }
+    input[type="text"], input[type="number"] {
+        font-family: "Lucida Console",monospace;
+        border-radius: 0;
+        border: 0.2vw solid #808080;
+        background-color: #121212;
+        color: #efefef;
+    }
+    input[type="text"]:focus, input[type="number"]:focus {
+        outline: #ffffff solid 0.1vw;
+    }
+    input[type="number"]::-webkit-outer-spin-button, input[type="number"]::-webkit-inner-spin-button {
+      -webkit-appearance: none;
+      appearance: none;
+      margin: 0;
+      padding: 0;
+    }
+    input[type="number"] {
+        -moz-appearance: textfield;
+        appearance: textfield;
+    }
+    input[type="color"] {
+        width: 2vw;
+        height: 2vw;
+        border: none;
+        padding: 0;
+        margin: 0;
+    }
+    input[type="range"] {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 10vw;
+        height: 2vw;
+        border: 0.2vw solid #000000;
+        background-color: #202020;
+    }
+    input[type="range"]::-webkit-slider-thumb  {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 2vw;
+        height: 2vw;
+        background-color: #606060;
+        border: 0.2vw solid #303030;
+        border-radius: 0vw;
+    }
+    input[type="range"]::-moz-range-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 2vw;
+        height: 2vw;
+        background-color: #606060;
+        border: 0.2vw solid #303030;
+        border-radius: 0vw;
+    }
+    input[type="checkbox"] {
+        opacity: 0;
+        position: absolute;
+    }
+    span.check {
+        display: inline-block;
+        width: 2vw;
+        height: 2vw;
+        background: radial-gradient(ellipse farthest-corner at center center, #050505 0%, #101010 40%, #252525 100%);
+        border: 0.2vw outset #505050;
+        color: rgba(0,0,0,0);
+        text-align: center;
+    }
+    input:hover ~ span.check {
+        background: radial-gradient(ellipse farthest-corner at center center, #050505 0%, #101010 40%, #ffffff 100%);
+    }
+    input:checked ~ span.check {
+        color: #ffffff;
+    }
+    table, tr, td {
+        padding: 0vw;
+        margin: 0vw;
+    }
+    td {
+        font-size: 1.8vw;
+    }
+    a {
+        color: #ffffff;
+    }
+    </style>
+    </head>
+    <body>
+    
+    <div id="uipanel" tabindex="-1">
+    
+    <div id="menu">
+    <div style="display: inline-block;">
+    <table>
+    <tbody><tr><td><span id="background_cfg" class="btn"><img src="Wrench.png" style="height: 2vw;"></span></td> <td>Environment</td> <td><select id="backgrounds" style="width: 9vw;"><option>None</option><option>Park</option><option>Woods</option><option>Snowy</option><option>Desert</option><option>Hall</option><option>City</option></select></td></tr>
+    <tr><td><span id="floor_cfg" class="btn"><img src="Wrench.png" style="height: 2vw;"></span></td> <td>Floor</td> <td><select id="floors" style="width: 9vw;"><option>None</option><option>Planks</option><option>Stone</option><option>Leaves</option><option>Metal</option></select></td></tr>
+    <tr><td><span id="pumpkin_cfg" class="btn"><img src="images/Wrench.png" style="height: 2vw;"></span></td> <td>Pumpkin</td> <td><span id="pumpkin_rand" class="btn">Random</span></td></tr>
+    </tbody></table>
+    </div>
+    
+    <div style="display: inline-block; vertical-align: top;">
+    <span id="new" class="btn">New</span> <span id="load" class="btn">Load</span> <span id="save" class="btn">Save</span> <span id="render" class="btn">Render</span><br>
+    <span id="free_camera" class="btn">Free Camera</span> <span id="view_controls" class="btn">Help Guide</span> <br>
+    <span id="view_credits" class="btn">About</span> <span style="font-size:0.9vw;">by David Alexander Wood 2024</span>
+    </div>
+    
+    <div style="display: inline-block; vertical-align: top;">
+    <span id="tool_carve" class="btn btn_sel" style="position:relative;"><img src="CarveTool.png" style="height:9vw;"><span class="tool">Carve</span></span>
+    <span id="tool_scoop" class="btn" style="position:relative;"><img src="ScoopTool.png" style="height:9vw;"><span class="tool">Scoop</span></span>
+    <span id="tool_fill" class="btn" style="position:relative;"><img src="FloodTool.png" style="height:9vw;"><span class="tool">Flood Fill</span></span>
+    <span id="tool_clear" class="btn" style="position:relative;"><img src="FloodTool.png" style="height:9vw;"><span class="tool">Flood Clear</span></span>
+    </div>
+    
+    <div style="display: inline-block; vertical-align: top;">
+    Size<br>
+    <input type="range" id="tool_size" style="width: 8vw;" min="0.001" max="0.05" step="any" value="0.01"><br>
+    Depth<br>
+    <input type="range" id="tool_depth" style="width: 8vw;" min="0.005" max="2" step="any" value="1">
+    </div>
+    
+    </div>
+    
+    
+    <div id="bgpanel" class="sidepanel" style="display:none;">
+    <span class="ptitle">Configure Environment</span>
+    <div style="height: 1vw;"></div>
+    
+    <label>Color Tint <input type="color" id="bg_color" value="#ffffff"></label><br>
+    Exposure <input type="range" id="bg_exposure" style="width: 10vw;" min="0" max="10" step="any" value="1"><br>
+    <label>Light Color <input type="color" id="light_color" value="#ffffff"></label><br>
+    Light Strength <input type="range" id="light_strength" style="width: 10vw;" min="0" max="40" step="any" value="1"><br>
+    Light Size <input type="range" id="light_size" style="width: 10vw;" min="-0.05" max="0.5" step="any" value="0.02"><br>
+    Camera Field of View <input type="range" id="camera_fov" style="width: 10vw;" min="0.5" max="5" step="any" value="1.2"><br>
+    <br>
+    <span class="btn" id="bg_load_custom">Load Custom Background</span><br>
+    <img id="custom_bg_img" style="width: 95%;">
+    </div>
+    
+    
+    <div id="floorpanel" class="sidepanel" style="display:none;">
+    <span class="ptitle">Configure Floor</span>
+    <div style="height: 1vw;"></div>
+    
+    <label>Color Tint <input type="color" id="floor_color" value="#ffffff"></label><br>
+    Scale <input type="range" id="floor_scale" style="width: 10vw;" min="0" max="1" step="any" value="0.5"><br>
+    Height <input type="range" id="floor_height" style="width: 10vw;" min="0" max="1" step="any" value="0.2"><br>
+    <br>
+    <span class="btn" id="floor_load_color">Load Custom Floor Color</span><br>
+    <img id="custom_floor_color" style="width: 95%;"><br>
+    <span class="btn" id="floor_load_height">Load Custom Floor Height</span><br>
+    <img id="custom_floor_height" style="width: 95%;"><br>
+    <span class="btn" id="floor_load_rough">Load Custom Floor Roughness</span><br>
+    <img id="custom_floor_rough" style="width: 95%;">
+    </div>
+    
+    
+    <div id="pumpkinpanel" class="sidepanel" style="display:none;">
+    <span class="ptitle">Configure Pumpkin</span>
+    <div style="height: 1vw;"></div>
+    
+    <label>Color <input type="color" id="pumpkin_color" value="#eb9b31"></label><br>
+    Height <input type="range" id="pumpkin_height" style="width: 10vw;" min="0.8" max="1.25" step="any" value="1"><br>
+    Indent <input type="range" id="pumpkin_indent" style="width: 10vw;" min="0" max="1" step="any" value="0.5"><br>
+    Main Grooves Rate <input type="range" id="pumpkin_rate0" style="width: 10vw;" min="4" max="24" step="1" value="10"><br>
+    Main Grooves Size <input type="range" id="pumpkin_size0" style="width: 10vw;" min="0" max="0.02" step="any" value="0.01"><br>
+    Grooves A Rate <input type="range" id="pumpkin_rate1" style="width: 10vw;" min="5" max="15" step="1" value="10"><br>
+    Grooves A Size <input type="range" id="pumpkin_size1" style="width: 10vw;" min="0" max="0.02" step="any" value="0.005"><br>
+    Grooves B Rate <input type="range" id="pumpkin_rate2" style="width: 10vw;" min="10" max="30" step="1" value="18"><br>
+    Grooves B Size <input type="range" id="pumpkin_size2" style="width: 10vw;" min="0" max="0.01" step="any" value="0.005"><br>
+    Grooves C Rate <input type="range" id="pumpkin_rate3" style="width: 10vw;" min="20" max="50" step="1" value="33"><br>
+    Grooves C Size <input type="range" id="pumpkin_size3" style="width: 10vw;" min="0" max="0.005" step="any" value="0.003"><br><br>
+    <span class="btn" id="pumpkin_import">Import Pumpkin Map</span><br>
+    <span class="btn" id="pumpkin_export">Export Pumpkin Map</span><br>
+    </div>
+    
+    
+    <div id="renderpanel" class="panel" style="display:none;">
+    <span class="ptitle">Rendering</span>
+    <br><br>
+    Width <input type="number" id="render_width" value="1280" step="1" min="1" style="width: 6vw;"><br>
+    Height <input type="number" id="render_height" value="720" step="1" min="1" style="width: 6vw;"><br>
+    Samples <input type="number" id="render_samples" value="1000" step="1" min="1" style="width: 6vw;"><br>
+    <label>Transparent Background <input type="checkbox" id="render_trans"><span class="check">X</span></label><br>
+    <br><br>
+    <span id="begin_render" class="btn" style="width: 10vw;">Begin Render</span> &nbsp;&nbsp;&nbsp;&nbsp;<span id="cancel_render" class="btn" style="width: 10vw;">Cancel</span>
+    </div>
+    
+    
+    <div id="renderingpanel" class="panel" style="display:none;">
+    <span class="ptitle">Render in Progress</span>
+    <br><br>
+    <span id="rendering_state"></span>
+    <br><br>
+    <span id="cancel_rendering" class="btn" style="width: 10vw;">Cancel</span>
+    </div>
+    
+    
+    <div id="resultpanel" class="panel" style="display:none;">
+    <span class="ptitle">Render Result</span>
+    <br>
+    Right click to save or copy the image.<br>
+    <img id="result_img" style="width: 95%;">
+    <br><br>
+    <span id="close_result" class="btn" style="width: 10vw;">Close</span>
+    </div>
+    
+    
+    <div id="guidepanel" class="panel" style="display:none;">
+    <span class="ptitle">Help Guide</span> <span id="close_controls" class="btn" style="width: 10vw;">Close</span>
+    <br><br>
+    Controls:<br>
+    <div id="mousecontrols" style="display: block;">
+    Left Mouse Button - Edit Pumpkin(Carve/Scoop/Flood)<br>
+    Right Mouse Button - Rotate Camera<br>
+    Mouse Scroll - Zoom Camera<br>
+    WASD/Arrow Keys - Move Camera<br>
+    </div>
+    <div id="touchcontrols" style="display: none;">
+    Single Touch - Edit Pumpkin(Carve/Scoop/Flood)<br>
+    Double Touch Move - Rotate Camera<br>
+    Double Touch Pinch - Zoom Camera
+    </div>
+    <br><br>
+    
+    How do I import a custom image onto the pumpkin?<br>
+    <div style="font-size: 1.3vw; width: 80%; display: inline-block;">
+    1. On the left of the bottom menu click the wrench icon beside 'Pumpkin', a new menu will open on the left.
+    2. Scroll down to the bottom of the new menu and click 'Import Pumpkin Map'.
+    3. Select your desired pumpkin image.
+    </div>
+    <br><br>
+    
+    Why does the screen go fuzzy whenever you move/change anything?<br>
+    <div style="font-size: 1.3vw; width: 80%; display: inline-block;">
+    Pumpkin Carving Simulator uses <a href="//wikipedia.org/wiki/Path_tracing" target="_blank"><span class="btn">path tracing</span></a> to render the pumpkin and environment with realistic lighting by pseudo randomly bouncing light rays around. Path tracing is gradual and
+    the quality increases with the number of light rays simulated, with a low number of rays the rendering appears fuzzy. When you move or change anything it needs to reset rendering, clearing all previous
+    light rays and giving you a fresh fuzzy rendering.
+    </div>
+    <br><br>
+    </div>
+    
+    </div>
+    
+    
+    <div id="creditspanel" class="panel" style="display:none;">
+    <span class="ptitle">Pumpking Carving Simulator</span> <span id="close_credits" class="btn" style="width: 10vw;">Close</span><br>
+    created by<br>
+    <span class="ptitle">Ethan Alexander Shulman 2022</span><br>
+    Version: 0<br>
+    Released on November 14, 2022<br>
+    This app is open source <a href="PumpkinCarvingSimulatorSource.zip" target="_blank"><span class="btn">Download Source Code</span></a>.<br><br>
+    
+    Assets Used:<br>
+    Wrench Image wikimedia.org<br>
+    Spoon Image wikimedia.org<br>
+    Knife Image wikimedia.org<br>
+    City Background polyhaven.com Greg Zaal<br>
+    Snowy Park Background polyhaven.com Oliksiy Yakovlyev<br>
+    Hall Background polyhaven.com Sergej Majboroda<br>
+    Desert Background polyhaven.com Sergej Majboroda<br>
+    Woods Background polyhaven.com Philip Modin<br>
+    Park Background polyhaven.com Andreas Mischok<br>
+    Leaves Floor polyhaven.com Dario Barresi and Dimitrios Savva<br>
+    Planks Floor polyhaven.com Dimitrios Savva and Rico Cilliers<br>
+    Stone Floor polyhaven.com Rob Tuytel<br>
+    Metal Floor textures.com
+    </div>
+    
+    
+    <div id="confirmpanel" class="panel" style="display:none;">
+    <span class="ptitle">Are you sure?</span><br>
+    This will overwrite the current pumpkin, if you haven't saved it will be lost forever.<br>
+    Are you sure?<br><br>
+    <span class="btn" id="confirm_yes" style="width: 10vw;">Yes</span> &nbsp;&nbsp;&nbsp;&nbsp;<span class="btn" id="confirm_no" style="width: 10vw;">No</span>
+    </div>
+    
+    
+    <div id="errorpanel" class="panel" style="display:none;">
+    <span class="ptitle">Error</span><br>
+    Failed to load pumpkin, map image must have a width of 1024 and height of 512.<br><br>
+    <span class="btn" id="error_close" style="width: 10vw;">Close</span>
+    </div>
+    
+    
+    
+    
+    </body><canvas height="1338" width="3840" style="width: 1920px; height: 669px;"></canvas>
