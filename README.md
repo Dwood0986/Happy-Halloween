@@ -23,3 +23,6 @@ The [`creditspanel`]acknowledges the creators and contributors of the simulator,
 Finally, the [`confirmpanel`] and [`errorpanel`] are used for confirmation dialogs and error messages, respectively, ensuring that users are informed of important actions and issues.
 
 Overall, the HTML code is well-structured to provide a comprehensive and interactive user interface for the Pumpkin Carving Simulator, with various options and tools for customizing and rendering a virtual pumpkin.
+
+
+There are issues still with the rendering of the simulated pumpkin image for some reason. If anyone knows what I am doing wrong I would greatly appreciate the advice. Happy coding!
